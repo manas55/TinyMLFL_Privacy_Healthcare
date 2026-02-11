@@ -1,0 +1,10 @@
+
+├── dataset_generator.py          # Synthetic EHR generation + preprocessing
+├── models.py                    # TinyML neural network
+├── privacy_mechanisms.py       # ANI and AHE (CKKS + RSA)
+├── fl_client.py               # Federated learning client
+├── fl_server.py               # Federated learning server
+├── attack.py                  # Membership inference attack
+├── utils.py                   # Energy estimator, metrics, plotting
+├── main_experiment.py        # Main experiment runner
+└── README.md                 # Setup and execution instructions
