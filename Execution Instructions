@@ -1,0 +1,7 @@
+Install dependencies:
+pip install -r requirements.txt
+
+Run the main experiment:
+python main_experiment.py
+
+The script will generate the synthetic dataset, run federated learning with the specified privacy configurations, and print a summary table with accuracy, membership inference attack success rate, privacy budget, latency, and energy.
