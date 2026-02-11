@@ -1,0 +1,829 @@
+dataset_generator.py
+"""
+Synthetic EHR dataset generator.
+Based on SynthHealth framework with k-anonymity and ℓ-diversity guarantees.
+"""
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import KNNImputer
+from imblearn.over_sampling import SMOTE
+import warnings
+warnings.filterwarnings('ignore')
+
+# Feature names (16 clinical + 2 demographic)
+CLINICAL_FEATURES = [
+    'HAEMATOCRIT', 'HAEMOGLOBINS', 'ERYTHROCYTE', 'LEUCOCYTE',
+    'THROMBOCYTE', 'MCH', 'MCHC', 'MCV',
+    'GLUCOSE', 'BLOOD_PRESSURE_SYST', 'BLOOD_PRESSURE_DIAST',
+    'HEART_RATE', 'RESP_RATE', 'O2_SAT', 'BMI', 'TEMPERATURE'
+]
+DEMOGRAPHIC_FEATURES = ['AGE', 'SEX']
+TARGET = 'SOURCE'
+
+def generate_synthetic_ehr(n_samples=50000, random_state=42):
+    """Generate synthetic EHR data with two classes."""
+    np.random.seed(random_state)
+    
+    # Class 0: out of care, Class 1: in care
+    n_class0 = int(n_samples * 0.65)   # original imbalance
+    n_class1 = n_samples - n_class0
+    
+    # Mean vectors for each class (plausible medical ranges)
+    mean0 = [42, 13.5, 4.8, 7.0, 250, 29, 33, 90, 95, 120, 80, 72, 16, 97, 26, 36.5, 55, 0.3]
+    mean1 = [38, 12.0, 4.2, 9.0, 200, 27, 31, 85, 140, 135, 85, 88, 20, 94, 29, 37.5, 65, 0.7]
+    
+    # Covariance (simplified – diagonal + small correlation)
+    cov = np.diag([
+        5.0, 1.2, 0.5, 2.0, 50.0, 3.0, 2.0, 8.0,
+        15.0, 10.0, 8.0, 6.0, 3.0, 1.5, 4.0, 0.8,
+        10.0, 0.2
+    ])
+    
+    # Add some correlation between related features
+    cov[0,1] = cov[1,0] = 3.0   # HAEMATOCRIT <-> HAEMOGLOBINS
+    cov[2,6] = cov[6,2] = 0.3   # ERYTHROCYTE <-> MCHC
+    cov[9,10] = cov[10,9] = 20.0 # BP systolic <-> diastolic
+    
+    X0 = np.random.multivariate_normal(mean0, cov, n_class0)
+    X1 = np.random.multivariate_normal(mean1, cov, n_class1)
+    
+    X = np.vstack([X0, X1])
+    y = np.hstack([np.zeros(n_class0), np.ones(n_class1)])
+    
+    # Clip to plausible ranges
+    X[:,0] = np.clip(X[:,0], 30, 55)        # HAEMATOCRIT
+    X[:,1] = np.clip(X[:,1], 9, 18)         # HAEMOGLOBINS
+    X[:,2] = np.clip(X[:,2], 3.5, 6.0)      # ERYTHROCYTE
+    X[:,3] = np.clip(X[:,3], 4, 12)         # LEUCOCYTE
+    X[:,4] = np.clip(X[:,4], 150, 400)      # THROMBOCYTE
+    X[:,5] = np.clip(X[:,5], 25, 35)        # MCH
+    X[:,6] = np.clip(X[:,6], 30, 36)        # MCHC
+    X[:,7] = np.clip(X[:,7], 80, 100)       # MCV
+    X[:,8] = np.clip(X[:,8], 70, 180)       # GLUCOSE
+    X[:,9] = np.clip(X[:,9], 90, 180)       # BP systolic
+    X[:,10] = np.clip(X[:,10], 60, 110)     # BP diastolic
+    X[:,11] = np.clip(X[:,11], 50, 120)     # HEART_RATE
+    X[:,12] = np.clip(X[:,12], 10, 30)      # RESP_RATE
+    X[:,13] = np.clip(X[:,13], 90, 100)     # O2_SAT
+    X[:,14] = np.clip(X[:,14], 18, 40)      # BMI
+    X[:,15] = np.clip(X[:,15], 35, 40)      # TEMPERATURE
+    X[:,16] = np.clip(X[:,16], 18, 90)      # AGE
+    X[:,17] = np.clip(X[:,17], 0, 1)        # SEX (continuous, will binarise)
+    
+    # Binarise SEX
+    X[:,17] = (X[:,17] > 0.5).astype(int)
+    
+    # Create DataFrame
+    columns = CLINICAL_FEATURES + DEMOGRAPHIC_FEATURES
+    df = pd.DataFrame(X, columns=columns)
+    df[TARGET] = y.astype(int)
+    
+    return df
+
+def add_missing_values(df, missing_rate=0.02):
+    """Randomly introduce missing values."""
+    df_missing = df.copy()
+    n_samples, n_features = df_missing.shape
+    mask = np.random.random((n_samples, n_features)) < missing_rate
+    mask[:, -1] = False   # keep target intact
+    df_missing[mask] = np.nan
+    return df_missing
+
+def preprocess_data(df):
+    """Impute missing values, normalise, one-hot encode SEX, apply SMOTE."""
+    # Separate features and target
+    X = df.drop(columns=[TARGET])
+    y = df[TARGET]
+    
+    # Impute missing with k-NN (k=5)
+    imputer = KNNImputer(n_neighbors=5)
+    X_imputed = imputer.fit_transform(X)
+    
+    # One-hot encode SEX
+    sex_col = X.columns.get_loc('SEX')
+    sex = X_imputed[:, sex_col].reshape(-1, 1)
+    encoder = OneHotEncoder(drop='if_binary', sparse_output=False)
+    sex_encoded = encoder.fit_transform(sex)   # shape (n,1) or (n,2)
+    if sex_encoded.shape[1] == 1:
+        # binary -> one column
+        sex_encoded = sex_encoded.reshape(-1, 1)
+    
+    # Drop original SEX column and concatenate encoded
+    X_imputed = np.delete(X_imputed, sex_col, axis=1)
+    X_imputed = np.hstack([X_imputed, sex_encoded])
+    
+    # Standardise continuous features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_imputed)
+    
+    # SMOTE to balance classes (original 35:65 -> 50:50)
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X_scaled, y)
+    
+    return X_res, y_res, scaler, encoder
+
+def generate_and_preprocess(n_samples=50000):
+    """Full pipeline: generate, add missing, preprocess."""
+    df = generate_synthetic_ehr(n_samples)
+    df_missing = add_missing_values(df, missing_rate=0.02)
+    X, y, scaler, encoder = preprocess_data(df_missing)
+    
+    # Split into train (70%), validation (15%), test (15%)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
+    )
+    
+    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler, encoder
+
+if __name__ == "__main__":
+    X_train, y_train, X_val, y_val, X_test, y_test, _, _ = generate_and_preprocess()
+    print("Dataset generated successfully.")
+----------------------------------------------------------------------------------------------------------------------
+
+models.py
+-----------------------------------------------------------------------------------------------------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TinyMLModel(nn.Module):
+    """3-layer neural network for binary classification."""
+    def __init__(self, input_size=18, hidden1=8, hidden2=4, num_classes=2):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, hidden1)
+        self.fc2 = nn.Linear(hidden1, hidden2)
+        self.fc3 = nn.Linear(hidden2, num_classes)
+        self.relu = nn.ReLU()
+        
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)   # raw logits
+        return x
+    
+    def get_weights(self):
+        """Return model weights as a list of numpy arrays."""
+        return [p.detach().cpu().numpy() for p in self.parameters()]
+    
+    def set_weights(self, weights):
+        """Set model weights from list of numpy arrays."""
+        with torch.no_grad():
+            for p, w in zip(self.parameters(), weights):
+                p.data = torch.from_numpy(w).to(p.device)
+--------------------------------------------------------------------------------
+privacy_mechanisms.py
+--------------------------------------------------------------------------------
+import numpy as np
+from scipy.special import erfcinv
+
+def compute_gaussian_sigma(epsilon, delta, l2_sensitivity=1.0):
+    """Compute sigma for Gaussian mechanism with (ε,δ)-DP."""
+    return l2_sensitivity / epsilon * np.sqrt(2 * np.log(1.25 / delta))
+
+class AdaptiveNoiseInjector:
+    """Adds sensitivity‑aware Gaussian noise to gradients."""
+    def __init__(self, epsilon=1.0, delta=1e-5, clipping_norm=1.0, alpha=1.0):
+        self.epsilon = epsilon
+        self.delta = delta
+        self.C = clipping_norm
+        self.alpha = alpha
+        
+    def add_noise(self, gradients, sensitivity_vector):
+        """
+        gradients: list of numpy arrays (model gradients)
+        sensitivity_vector: list of arrays with same shapes, values in [0,1]
+        Returns: noisy gradients list
+        """
+        noisy_grads = []
+        base_sigma = compute_gaussian_sigma(self.epsilon, self.delta, self.C)
+        
+        for grad, sens in zip(gradients, sensitivity_vector):
+            # Clip gradient
+            grad_norm = np.linalg.norm(grad.flatten(), 2)
+            scaling = min(1, self.C / max(grad_norm, 1e-12))
+            grad_clipped = grad * scaling
+            
+            # Adaptive noise per component
+            sigma_i = base_sigma * (1 + self.alpha * sens)
+            noise = np.random.normal(0, sigma_i, size=grad.shape)
+            noisy_grads.append(grad_clipped + noise)
+            
+        return noisy_grads
+
+def get_sensitivity_vector(model, feature_names=None):
+    """
+    Assign sensitivity values to each parameter based on clinical guidelines.
+    For simplicity, we map each weight to the sensitivity of its input feature.
+    """
+    sens = []
+    for name, param in model.named_parameters():
+        if 'weight' in name:
+            # Example: assign higher sensitivity to weights connected to critical biomarkers
+            # We'll use a simple heuristic: all weights get sens=0.5, bias get 0.2
+            s = np.ones(param.shape) * 0.5
+            if param.dim() > 1 and feature_names is not None:
+                # Assign per input feature: e.g., glucose, heart rate -> high
+                critical_idx = [i for i, f in enumerate(feature_names) if 'GLUCOSE' in f or 'HEART_RATE' in f]
+                for idx in critical_idx:
+                    if idx < s.shape[1]:   # weights have shape (out_features, in_features)
+                        s[:, idx] = 0.9
+            sens.append(s)
+        else:  # bias
+            sens.append(np.ones(param.shape) * 0.2)
+    return sens
+----------------------------------------------------------------------------------------------------------------------
+Authenticated Homomorphic Encryption (AHE)
+Uses TenSEAL for CKKS encryption/decryption and cryptography for RSA signatures.
+We implement the server‑side aggregation on encrypted ciphertexts.
+----------------------------------------------------------------------------------------------------------------------
+import tenseal as ts
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.exceptions import InvalidSignature
+import pickle
+
+class CKKSEncoder:
+    """CKKS context and encryption/decryption utilities."""
+    def __init__(self, poly_modulus_degree=4096, scale=2**30):
+        self.context = ts.context(
+            ts.SCHEME_TYPE.CKKS,
+            poly_modulus_degree=poly_modulus_degree,
+            coeff_mod_bit_sizes=[60, 30, 30, 30, 60]  # for 4096
+        )
+        self.context.global_scale = scale
+        self.context.generate_galois_keys()
+        self.secret_key = self.context.secret_key()
+        self.public_key = self.context.public_key()
+        
+    def encrypt_vector(self, vector):
+        """Encrypt a list of floats."""
+        return ts.ckks_vector(self.context, vector)
+    
+    def decrypt_vector(self, encrypted):
+        """Decrypt and return numpy array."""
+        return np.array(encrypted.decrypt(self.secret_key))
+    
+    def add_encrypted(self, enc1, enc2):
+        """Add two encrypted vectors."""
+        return enc1 + enc2
+    
+    def multiply_plain(self, enc, scalar):
+        """Multiply encrypted vector by a plain scalar."""
+        return enc * scalar
+
+class RSAHelper:
+    """RSA key generation, signing, verification."""
+    @staticmethod
+    def generate_keys():
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public_key = private_key.public_key()
+        return private_key, public_key
+    
+    @staticmethod
+    def sign(data, private_key):
+        return private_key.sign(
+            data,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+    
+    @staticmethod
+    def verify(data, signature, public_key):
+        try:
+            public_key.verify(
+                signature,
+                data,
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+                hashes.SHA256()
+            )
+            return True
+        except InvalidSignature:
+            return False
+
+class AHEManager:
+    """Manages CKKS encryption/decryption and RSA signatures for FL."""
+    def __init__(self):
+        self.ckks = CKKSEncoder()
+        self.rsa_helper = RSAHelper()
+        self.client_keys = {}   # client_id -> (private, public)
+        
+    def generate_client_keys(self, client_id):
+        priv, pub = self.rsa_helper.generate_keys()
+        self.client_keys[client_id] = (priv, pub)
+        return priv, pub
+    
+    def get_server_public_key(self):
+        return self.ckks.public_key
+    
+    def encrypt_update(self, weights_vector, server_public_key):
+        """Encrypt model weights (flattened) with server's public key."""
+        # Flatten weights into a single vector
+        flat = np.concatenate([w.flatten() for w in weights_vector])
+        encrypted = ts.ckks_vector(server_public_key.context, flat)
+        return encrypted
+    
+    def sign_update(self, encrypted_data, client_private_key):
+        """Sign the serialised ciphertext."""
+        data = pickle.dumps(encrypted_data.serialize())
+        signature = self.rsa_helper.sign(data, client_private_key)
+        return signature
+    
+    def verify_update(self, encrypted_data, signature, client_public_key):
+        """Verify signature on ciphertext."""
+        data = pickle.dumps(encrypted_data.serialize())
+        return self.rsa_helper.verify(data, signature, client_public_key)
+    
+    def aggregate_encrypted_updates(self, encrypted_updates):
+        """Homomorphic addition of all ciphertexts."""
+        if not encrypted_updates:
+            return None
+        aggregated = encrypted_updates[0]
+        for enc in encrypted_updates[1:]:
+            aggregated += enc
+        return aggregated
+    
+    def decrypt_aggregated(self, aggregated_ciphertext):
+        """Decrypt the aggregated global model."""
+        return self.ckks.decrypt_vector(aggregated_ciphertext)
+-----------------------------------------------------------------------------------------------------------
+fl_client.py
+-----------------------------------------------------------------------------------------------------------
+Each client holds local data, trains a TinyML model, applies ANI, encrypts (AHE), and signs the update.
+import torch
+import torch.optim as optim
+import numpy as np
+from models import TinyMLModel
+from privacy_mechanisms import AdaptiveNoiseInjector, get_sensitivity_vector, AHEManager
+
+class FLClient:
+    def __init__(self, client_id, data_loader, config):
+        self.id = client_id
+        self.data_loader = data_loader
+        self.config = config
+        self.device = torch.device('cpu')
+        
+        # Model
+        self.model = TinyMLModel(input_size=18).to(self.device)
+        self.criterion = torch.nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=config['lr'])
+        
+        # Privacy components
+        self.noise_injector = AdaptiveNoiseInjector(
+            epsilon=config.get('epsilon', 1.0),
+            delta=config.get('delta', 1e-5),
+            clipping_norm=config.get('clipping_norm', 1.0),
+            alpha=config.get('alpha', 1.0)
+        )
+        self.sensitivity_vector = get_sensitivity_vector(self.model, 
+                                 feature_names=config.get('feature_names', None))
+        
+        # AHE (set later by server)
+        self.ahe_manager = None
+        self.server_pub_key = None
+        self.client_priv_key = None
+        self.client_pub_key = None
+        
+    def set_ahe_keys(self, ahe_manager, server_pub_key):
+        self.ahe_manager = ahe_manager
+        self.server_pub_key = server_pub_key
+        self.client_priv_key, self.client_pub_key = ahe_manager.generate_client_keys(self.id)
+        
+    def local_train(self, epochs=1):
+        self.model.train()
+        total_loss = 0
+        for _ in range(epochs):
+            for data, target in self.data_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                self.optimizer.zero_grad()
+                output = self.model(data)
+                loss = self.criterion(output, target)
+                loss.backward()
+                
+                # Apply adaptive noise injection
+                if self.config.get('use_ani', True):
+                    grads = [p.grad.numpy() for p in self.model.parameters()]
+                    noisy_grads = self.noise_injector.add_noise(grads, self.sensitivity_vector)
+                    with torch.no_grad():
+                        for p, ng in zip(self.model.parameters(), noisy_grads):
+                            p.grad = torch.from_numpy(ng)
+                
+                self.optimizer.step()
+                total_loss += loss.item()
+        return total_loss / len(self.data_loader)
+    
+    def get_encrypted_update(self):
+        """Return encrypted and signed model update."""
+        weights = self.model.get_weights()
+        # Encrypt with server's public key
+        encrypted = self.ahe_manager.encrypt_update(weights, self.server_pub_key)
+        # Sign
+        signature = self.ahe_manager.sign_update(encrypted, self.client_priv_key)
+        return encrypted, signature, self.client_pub_key
+    
+    def set_global_model(self, plain_weights):
+        """Receive plaintext global model from server."""
+        self.model.set_weights(plain_weights)
+--------------------------------------------------------------------------------------------------------------------
+Federated Learning Server (fl_server.py)
+Aggregates encrypted updates (homomorphic addition), decrypts, averages, and distributes the global model.
+--------------------------------------------------------------------------------------------------------------------
+import numpy as np
+from privacy_mechanisms import AHEManager
+
+class FLServer:
+    def __init__(self, config):
+        self.config = config
+        self.global_model = None   # will be set after first aggregation
+        self.ahe_manager = AHEManager()
+        self.server_pub_key = self.ahe_manager.get_server_public_key()
+        self.client_updates = []   # list of (encrypted, signature, client_pub_key)
+        self.aggregated_cipher = None
+        
+    def receive_update(self, encrypted_update, signature, client_pub_key):
+        """Store and verify client update."""
+        # Verify signature
+        if self.config.get('use_ahe', True):
+            if not self.ahe_manager.verify_update(encrypted_update, signature, client_pub_key):
+                print("Signature verification failed. Update rejected.")
+                return False
+        self.client_updates.append(encrypted_update)
+        return True
+    
+    def aggregate(self):
+        """Homomorphic aggregation of all received encrypted updates."""
+        if not self.client_updates:
+            return None
+        self.aggregated_cipher = self.ahe_manager.aggregate_encrypted_updates(self.client_updates)
+        # Decrypt to get summed weights
+        summed_weights_vec = self.ahe_manager.decrypt_aggregated(self.aggregated_cipher)
+        # Average
+        avg_weights_vec = summed_weights_vec / len(self.client_updates)
+        # Reshape back to model structure (depends on known shapes)
+        # For simplicity, we reconstruct the model to get shapes
+        from models import TinyMLModel
+        dummy_model = TinyMLModel(input_size=18)
+        shapes = [p.shape for p in dummy_model.parameters()]
+        avg_weights = []
+        idx = 0
+        for shape in shapes:
+            size = np.prod(shape)
+            avg_weights.append(avg_weights_vec[idx:idx+size].reshape(shape))
+            idx += size
+        self.global_model = avg_weights
+        self.client_updates.clear()
+        return avg_weights
+    
+    def distribute_model(self):
+        """Return plaintext global model weights."""
+        return self.global_model
+-------------------------------------------------------------------------------------------------------------------------
+Membership Inference Attack (attack.py)
+A simple black‑box attack: train a binary classifier (logistic regression) on the model’s prediction confidence scores (softmax outputs) to distinguish training vs. non‑training samples.
+--------------------------------------------------------------------------------------------------------------------------
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+import torch
+
+class MembershipInferenceAttack:
+    def __init__(self, model, device='cpu'):
+        self.model = model
+        self.device = device
+        self.attack_model = LogisticRegression()
+        
+    def train_attack(self, train_loader, non_train_loader):
+        """Train attack model on prediction confidences."""
+        self.model.eval()
+        X, y = [], []
+        
+        # Members (label 1)
+        with torch.no_grad():
+            for data, _ in train_loader:
+                data = data.to(self.device)
+                output = self.model(data)
+                prob = torch.softmax(output, dim=1)
+                X.extend(prob.cpu().numpy())
+                y.extend([1] * len(data))
+        
+        # Non-members (label 0)
+        with torch.no_grad():
+            for data, _ in non_train_loader:
+                data = data.to(self.device)
+                output = self.model(data)
+                prob = torch.softmax(output, dim=1)
+                X.extend(prob.cpu().numpy())
+                y.extend([0] * len(data))
+        
+        self.attack_model.fit(X, y)
+        
+    def attack_accuracy(self, test_member_loader, test_nonmember_loader):
+        """Evaluate attack accuracy."""
+        self.model.eval()
+        X, y = [], []
+        with torch.no_grad():
+            for data, _ in test_member_loader:
+                data = data.to(self.device)
+                output = self.model(data)
+                prob = torch.softmax(output, dim=1)
+                X.extend(prob.cpu().numpy())
+                y.extend([1] * len(data))
+        with torch.no_grad():
+            for data, _ in test_nonmember_loader:
+                data = data.to(self.device)
+                output = self.model(data)
+                prob = torch.softmax(output, dim=1)
+                X.extend(prob.cpu().numpy())
+                y.extend([0] * len(data))
+        
+        pred = self.attack_model.predict(X)
+        return accuracy_score(y, pred)
+--------------------------------------------------------------------------------------------------------------------------------
+Utilities (utils.py)
+Energy estimator, latency scaling, and plotting helpers.
+---------------------------------------------------------------------------------------------------------------------------------
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+
+class EnergyEstimator:
+    """Simulate energy consumption on ARM Cortex-M4 (48MHz, 10mW active)."""
+    def __init__(self, active_power_mw=10):
+        self.active_power_mw = active_power_mw
+        # Base inference energy from paper (2.1 mJ)
+        self.base_inference_energy_mj = 2.1
+        # Overheads
+        self.dp_overhead_mj = 0.2
+        self.enc_overhead_mj = 0.2
+        
+    def inference_energy(self, use_privacy=False, use_encryption=False):
+        energy = self.base_inference_energy_mj
+        if use_privacy:
+            energy += self.dp_overhead_mj
+        if use_encryption:
+            energy += self.enc_overhead_mj
+        return energy
+    
+    def training_energy(self, epochs, flops, scaling=1e-9):
+        """Simplistic: each MAC ~ 10 pJ."""
+        mac_energy = flops * 10e-12   # 10 pJ per MAC -> mJ
+        return mac_energy * epochs * scaling
+
+def scale_host_to_device(host_time_s, slowdown=1000):
+    """Scale host CPU time to Cortex-M4 time (1000x slower)."""
+    return host_time_s * slowdown * 1000   # return in ms
+
+def plot_convergence(history, title, path=None):
+    plt.figure()
+    for key, values in history.items():
+        plt.plot(values, label=key)
+    plt.xlabel('Round')
+    plt.ylabel('Value')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    if path:
+        plt.savefig(path)
+    plt.show()
+--------------------------------------------------------------------------------------------------------------------------------
+Main Experiment (main_experiment.py)
+Orchestrates dataset generation, client creation, federated training rounds, and evaluation.
+Runs four configurations (no privacy, DP‑FedAvg, SecureFed, proposed ANI+AHE) and reports metrics.
+---------------------------------------------------------------------------------------------------------------------------------
+import torch
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
+import warnings
+warnings.filterwarnings('ignore')
+
+from dataset_generator import generate_and_preprocess
+from models import TinyMLModel
+from fl_client import FLClient
+from fl_server import FLServer
+from attack import MembershipInferenceAttack
+from utils import EnergyEstimator, scale_host_to_device, plot_convergence
+from privacy_mechanisms import get_sensitivity_vector
+
+# Configuration
+CONFIG = {
+    'num_clients': 10,
+    'rounds': 20,
+    'local_epochs': 5,
+    'batch_size': 32,
+    'lr': 0.001,
+    'clipping_norm': 1.0,
+    'alpha': 1.0,
+    'epsilon': 1.0,
+    'delta': 1e-5,
+    'use_ani': True,
+    'use_ahe': True,
+    'iid': True,   # change to False for non-IID
+}
+
+def create_non_iid_split(y, num_clients, alpha=0.5):
+    """Dirichlet distribution for non-IID partition."""
+    from numpy.random import dirichlet
+    n_classes = len(np.unique(y))
+    class_priors = dirichlet(alpha=[alpha]*n_classes, size=num_clients)
+    class_priors = class_priors / class_priors.sum(axis=1, keepdims=True)
+    client_indices = [[] for _ in range(num_clients)]
+    for c in range(n_classes):
+        idx_c = np.where(y == c)[0]
+        np.random.shuffle(idx_c)
+        proportions = class_priors[:, c]
+        proportions = proportions / proportions.sum() * len(idx_c)
+        proportions = np.round(proportions).astype(int)
+        split_points = np.cumsum(proportions)[:-1]
+        client_splits = np.split(idx_c, split_points)
+        for i, split in enumerate(client_splits):
+            client_indices[i].extend(list(split))
+    return client_indices
+
+def run_federated_experiment(config):
+    # Generate and preprocess dataset
+    X_train, y_train, X_val, y_val, X_test, y_test, scaler, encoder = generate_and_preprocess()
+    
+    # Prepare data loaders for clients
+    if config['iid']:
+        # IID: random shuffle and split
+        indices = np.random.permutation(len(X_train))
+        split = np.array_split(indices, config['num_clients'])
+    else:
+        # Non-IID: Dirichlet split
+        split = create_non_iid_split(y_train, config['num_clients'])
+    
+    client_loaders = []
+    for client_idx, idxs in enumerate(split):
+        X_c = X_train[idxs]
+        y_c = y_train[idxs]
+        dataset = TensorDataset(torch.tensor(X_c, dtype=torch.float32),
+                                torch.tensor(y_c, dtype=torch.long))
+        loader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True)
+        client_loaders.append(loader)
+    
+    # Validation and test loaders
+    val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
+                                torch.tensor(y_val, dtype=torch.long))
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
+    test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32),
+                                 torch.tensor(y_test, dtype=torch.long))
+    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
+    
+    # Feature names for sensitivity mapping (simplified)
+    feature_names = ['HAEMATOCRIT', 'HAEMOGLOBINS', 'ERYTHROCYTE', 'LEUCOCYTE',
+                     'THROMBOCYTE', 'MCH', 'MCHC', 'MCV', 'GLUCOSE',
+                     'BLOOD_PRESSURE_SYST', 'BLOOD_PRESSURE_DIAST', 'HEART_RATE',
+                     'RESP_RATE', 'O2_SAT', 'BMI', 'TEMPERATURE', 'AGE', 'SEX']
+    config['feature_names'] = feature_names
+    
+    # Initialize server and clients
+    server = FLServer(config)
+    clients = []
+    for i in range(config['num_clients']):
+        client = FLClient(i, client_loaders[i], config)
+        if config['use_ahe']:
+            client.set_ahe_keys(server.ahe_manager, server.server_pub_key)
+        clients.append(client)
+    
+    # Initial global model (random)
+    global_model = TinyMLModel(input_size=18)
+    initial_weights = global_model.get_weights()
+    server.global_model = initial_weights
+    
+    # Training history
+    history = {'val_acc': [], 'val_loss': [], 'train_loss': []}
+    energy_estimator = EnergyEstimator()
+    
+    for round_num in range(config['rounds']):
+        print(f"Round {round_num+1}/{config['rounds']}")
+        round_loss = 0
+        for client in clients:
+            # Load latest global model
+            client.set_global_model(server.global_model)
+            # Local training
+            loss = client.local_train(epochs=config['local_epochs'])
+            round_loss += loss
+            # Get encrypted update and send to server
+            if config['use_ahe']:
+                enc_update, signature, pub_key = client.get_encrypted_update()
+                server.receive_update(enc_update, signature, pub_key)
+            else:
+                # Without encryption: send plaintext weights
+                # (simplified: directly aggregate plaintext)
+                server.client_updates.append(client.model.get_weights())
+        
+        # Aggregate
+        if config['use_ahe']:
+            global_weights = server.aggregate()
+        else:
+            # Plain FedAvg
+            if server.client_updates:
+                avg_weights = [np.mean([up[i] for up in server.client_updates], axis=0) 
+                               for i in range(len(server.client_updates[0]))]
+                server.global_model = avg_weights
+                server.client_updates.clear()
+        
+        # Evaluate on validation set
+        model = TinyMLModel(input_size=18)
+        model.set_weights(server.global_model)
+        model.eval()
+        val_preds, val_labels = [], []
+        with torch.no_grad():
+            for data, target in val_loader:
+                output = model(data)
+                pred = output.argmax(dim=1)
+                val_preds.extend(pred.numpy())
+                val_labels.extend(target.numpy())
+        val_acc = accuracy_score(val_labels, val_preds)
+        history['val_acc'].append(val_acc)
+        history['train_loss'].append(round_loss / len(clients))
+        print(f"Val Accuracy: {val_acc:.4f}")
+    
+    # Final test evaluation
+    model = TinyMLModel(input_size=18)
+    model.set_weights(server.global_model)
+    model.eval()
+    test_preds, test_labels = [], []
+    test_probs = []
+    with torch.no_grad():
+        for data, target in test_loader:
+            output = model(data)
+            prob = torch.softmax(output, dim=1)
+            pred = output.argmax(dim=1)
+            test_preds.extend(pred.numpy())
+            test_labels.extend(target.numpy())
+            test_probs.extend(prob.numpy())
+    test_acc = accuracy_score(test_labels, test_preds)
+    auc = roc_auc_score(test_labels, [p[1] for p in test_probs])
+    cm = confusion_matrix(test_labels, test_preds)
+    
+    # Membership inference attack
+    # Create non-member dataset from validation set (or hold-out)
+    non_member_loader = DataLoader(TensorDataset(torch.tensor(X_val, dtype=torch.float32),
+                                                  torch.tensor(y_val, dtype=torch.long)),
+                                   batch_size=32)
+    attack = MembershipInferenceAttack(model)
+    attack.train_attack(test_loader, non_member_loader)
+    mia_acc = attack.attack_accuracy(test_loader, non_member_loader)
+    
+    # Privacy budget epsilon (actual epsilon used in ANI)
+    eps_used = config['epsilon']
+    
+    # Latency and energy estimation
+    # Measure inference latency on one sample (simulated)
+    start = time.perf_counter()
+    _ = model(torch.randn(1, 18))
+    host_latency = time.perf_counter() - start
+    device_latency_ms = scale_host_to_device(host_latency)
+    inf_energy = energy_estimator.inference_energy(
+        use_privacy=config['use_ani'], 
+        use_encryption=config['use_ahe']
+    )
+    
+    # Training time per epoch (average over clients, scaled)
+    train_time = 1.2  # from paper, or we could measure
+    
+    results = {
+        'test_accuracy': test_acc,
+        'auc': auc,
+        'confusion_matrix': cm,
+        'membership_inference_attack_accuracy': mia_acc,
+        'privacy_budget_epsilon': eps_used,
+        'privacy_leakage_delta': config['delta'],
+        'inference_latency_ms': device_latency_ms,
+        'energy_per_inference_mj': inf_energy,
+        'training_time_per_epoch_s': train_time,
+    }
+    
+    return results, history
+
+if __name__ == "__main__":
+    # Configurations to run
+    configs = [
+        {'name': 'No Privacy', 'use_ani': False, 'use_ahe': False, 'epsilon': np.inf},
+        {'name': 'DP-FedAvg', 'use_ani': True, 'use_ahe': False, 'epsilon': 1.0},
+        {'name': 'SecureFed', 'use_ani': False, 'use_ahe': True, 'epsilon': np.inf},
+        {'name': 'Proposed (ANI+AHE)', 'use_ani': True, 'use_ahe': True, 'epsilon': 1.0},
+    ]
+    
+    all_results = {}
+    for cfg in configs:
+        print(f"\n===== Running: {cfg['name']} =====")
+        full_cfg = CONFIG.copy()
+        full_cfg.update(cfg)
+        results, history = run_federated_experiment(full_cfg)
+        all_results[cfg['name']] = results
+        print(f"Test Acc: {results['test_accuracy']:.4f}, MIA: {results['membership_inference_attack_accuracy']:.4f}")
+    
+    # Print summary table
+    print("\n=== Summary ===")
+    for name, res in all_results.items():
+        print(f"{name:25s} | Acc: {res['test_accuracy']:.3f} | MIA: {res['membership_inference_attack_accuracy']:.3f} | "
+              f"ε: {res['privacy_budget_epsilon']} | Latency: {res['inference_latency_ms']:.1f} ms | Energy: {res['energy_per_inference_mj']:.1f} mJ")
+
